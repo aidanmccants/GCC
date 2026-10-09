@@ -33,6 +33,7 @@ html,body{height:100%;margin:0;overflow:hidden;background:var(--slate);color:var
 #keys{left:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));padding:8px 12px;font-size:13px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 14px;max-width:calc(100vw - 48px)}
 #keys kbd{font-family:var(--f-mono);font-size:11px;color:var(--ink);border:1px solid var(--hud-line);border-bottom-width:2px;border-radius:3px;padding:0 5px;margin-right:4px;background:rgba(255,255,255,.04)}
 #mode{right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));padding:6px 10px;font-family:var(--f-display);font-size:11px;letter-spacing:.08em}
+#online{right:12px;bottom:calc(46px + env(safe-area-inset-bottom,0px));padding:6px 10px;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
 #cross{position:fixed;left:50%;top:50%;width:14px;height:14px;margin:-7px 0 0 -7px;pointer-events:none;opacity:.7}
 #cross::before,#cross::after{content:"";position:absolute;background:var(--ink);box-shadow:0 0 2px #000}
 #cross::before{left:6px;top:0;width:2px;height:14px}#cross::after{top:6px;left:0;width:14px;height:2px}
@@ -70,6 +71,7 @@ html,body{height:100%;margin:0;overflow:hidden;background:var(--slate);color:var
 <div id="mini" class="chip" hidden><canvas id="minic" width="360" height="360"></canvas><div id="heading">N</div></div>
 <div id="keys" class="chip" hidden><span><kbd>WASD</kbd>walk</span><span><kbd>Shift</kbd>run</span><span><kbd>Space</kbd>jump</span><span><kbd>F</kbd>fly</span><span><kbd>M</kbd>map</span><span><kbd>N</kbd>time of day</span><span><kbd>L</kbd>labels</span><span><kbd>Esc</kbd>free mouse</span></div>
 <div id="mode" class="chip" hidden>WALK</div>
+<div id="online" class="chip" hidden></div>
 <div id="touch" hidden><div id="joy"><i></i></div>
   <button class="tbtn" id="tJump" style="bottom:calc(150px + env(safe-area-inset-bottom,0px))">JUMP</button>
   <button class="tbtn" id="tFly" style="bottom:calc(84px + env(safe-area-inset-bottom,0px))">FLY</button>
@@ -1268,12 +1270,107 @@ function updatePeople(dt, now) {
   function spawn_(pp) { C.spawn(pp); }
 }
 
+/* ---------------- multiplayer: the Worker relays positions; names are random and assigned by the server ---------------- */
+const remotes = new Map(); let netSock = null, myId = null, myName = '', netRetries = 0, netSentAt = 0, netSent = null, netOff = false;
+const SHIRTS = ['#c0392b', '#2e86c1', '#28b463', '#f1c40f', '#8e44ad', '#ecf0f1', '#e67e22', '#16a085'];
+const limbGeo = (() => { const g = new THREE.BoxGeometry(1, 1, 1); g.translate(0, -.5, 0); return g; })();   // pivots at the hip or shoulder
+function nameTag(text) {
+  const cv = document.createElement('canvas'); cv.width = 256; cv.height = 64; const g = cv.getContext('2d');
+  g.fillStyle = 'rgba(20,22,26,.75)'; g.fillRect(4, 10, 248, 44);
+  g.fillStyle = '#fff'; g.font = '600 30px "Barlow Semi Condensed", sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 128, 33);
+  const t = new THREE.CanvasTexture(cv); t.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, transparent: true, depthWrite: false, fog: false }));
+  sp.scale.set(3.2, .8, 1); sp.position.y = 2.3; return sp;
+}
+function makeAvatar(name, id) {
+  const shirt = SHIRTS[[...id].reduce((a, c) => a + c.charCodeAt(0), 0) % SHIRTS.length], skin = '#e8b896', pants = '#2b3a55';
+  const g = new THREE.Group(), mat = c => new THREE.MeshLambertMaterial({ color: c });
+  const limb = (sx, sy, sz, c, x, y) => { const m = new THREE.Mesh(limbGeo, mat(c)); m.scale.set(sx, sy, sz); m.position.set(x, y, 0); g.add(m); return m; };
+  const part = (sx, sy, sz, c, y) => { const m = new THREE.Mesh(boxGeo, mat(c)); m.scale.set(sx, sy, sz); m.position.y = y; g.add(m); };
+  const legL = limb(.2, .85, .22, pants, -.12, .85), legR = limb(.2, .85, .22, pants, .12, .85);
+  const armL = limb(.14, .7, .16, shirt, -.33, 1.5), armR = limb(.14, .7, .16, shirt, .33, 1.5);
+  part(.5, .68, .28, shirt, .85); part(.32, .32, .32, skin, 1.55); part(.34, .1, .34, '#3a2a1e', 1.85);
+  const tag = nameTag(name); g.add(tag);
+  return { g, legL, legR, armL, armR, tag };
+}
+function remoteFor(p) {
+  let r = remotes.get(p.id);
+  if (!r) {
+    r = { ...makeAvatar(p.name, p.id), name: p.name, seen: false, x: 0, y: 0, z: 0, yaw: 0, tx: 0, ty: 0, tz: 0, tyaw: 0, walk: 0 };
+    r.g.visible = false; scene.add(r.g); remotes.set(p.id, r);
+  }
+  return r;
+}
+// a visitor is shown once their first position arrives
+function applyMove(p) {
+  const r = remoteFor(p);
+  r.tx = p.x; r.ty = p.y; r.tz = p.z; r.tyaw = p.yaw;
+  if (!r.seen) { r.seen = true; r.x = p.x; r.y = p.y; r.z = p.z; r.yaw = p.yaw; r.g.visible = true; updateOnline(); }
+}
+function dropRemote(id) {
+  const r = remotes.get(id); if (!r) return;
+  scene.remove(r.g); r.g.traverse(o => { if (o.material) { o.material.map?.dispose(); o.material.dispose(); } });
+  remotes.delete(id);
+}
+function updateRemotes(dt) {
+  const k = Math.min(1, dt * 10);   // ease toward the last received position
+  for (const r of remotes.values()) {
+    if (!r.seen) continue;
+    const px = r.x, pz = r.z, dyaw = Math.atan2(Math.sin(r.tyaw - r.yaw), Math.cos(r.tyaw - r.yaw));
+    r.x += (r.tx - r.x) * k; r.y += (r.ty - r.y) * k; r.z += (r.tz - r.z) * k; r.yaw += dyaw * k;
+    const sp = Math.hypot(r.x - px, r.z - pz) / Math.max(dt, 1e-3);
+    r.walk += dt * 9 * Math.min(1, sp / 3);
+    const sw = Math.sin(r.walk) * .6 * Math.min(1, sp / 2);
+    r.g.position.set(r.x, r.y, r.z); r.g.rotation.y = r.yaw + Math.PI;   // the player's forward is (-sin yaw, -cos yaw)
+    r.legL.rotation.x = sw; r.legR.rotation.x = -sw; r.armL.rotation.x = -sw; r.armR.rotation.x = sw;
+    r.tag.visible = Math.hypot(r.x - P.x, r.z - P.z) < 120;
+  }
+}
+function sendMove(now) {
+  if (!netSock || netSock.readyState !== 1 || now - netSentAt < 120) return;   // at most about 8 updates a second
+  const moved = !netSent || Math.hypot(P.x - netSent.x, P.z - netSent.z) > .02 || Math.abs(P.y - netSent.y) > .02 || Math.abs(yaw - netSent.yaw) > .01;
+  if (!moved && now - netSentAt < 4000) return;   // standing still: a keep-alive every 4 s
+  netSentAt = now; netSent = { x: P.x, y: P.y, z: P.z, yaw };
+  netSock.send(JSON.stringify({ t: 'move', x: +P.x.toFixed(2), y: +P.y.toFixed(2), z: +P.z.toFixed(2), yaw: +yaw.toFixed(3) }));
+}
+function onNet(m) {
+  if (m.t === 'welcome') { myId = m.id; myName = m.name; for (const p of m.players) applyMove(p); sendMove(performance.now()); }
+  else if (m.t === 'join') remoteFor(m);
+  else if (m.t === 'move') { applyMove(m); return; }
+  else if (m.t === 'leave') dropRemote(m.id);
+  else if (m.t === 'full') { netOff = true; return updateOnline('The campus is full right now. Try again in a bit.'); }
+  updateOnline();
+}
+function connectNet() {
+  if (netSock || netOff) return;
+  if (!/^https?:$/.test(location.protocol)) { netOff = true; return updateOnline('Single player: open the Worker URL to meet others'); }
+  let sock;
+  try { sock = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'); }
+  catch (e) { netOff = true; return updateOnline('Single player: multiplayer is unavailable here'); }
+  netSock = sock; updateOnline('Connecting to campus…');
+  sock.onopen = () => { netRetries = 0; updateOnline(); };
+  sock.onmessage = e => { try { onNet(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+  sock.onclose = () => {
+    netSock = null; netSent = null; for (const id of [...remotes.keys()]) dropRemote(id);
+    if (netOff) return;
+    if (++netRetries > 5) { netOff = true; return updateOnline('Offline: could not reach the campus server'); }
+    updateOnline('Reconnecting…'); setTimeout(connectNet, Math.min(15000, 1000 * 2 ** netRetries));
+  };
+}
+function updateOnline(note) {
+  const el = $('online'); if (!el) return;
+  el.hidden = false;
+  const others = [...remotes.values()].filter(r => r.seen).length;
+  el.textContent = note || (myName ? `● ${others + 1} online · you are ${myName}` : 'Connecting to campus…');
+}
+
 /* ---------------- main ---------------- */
 let last = performance.now();
 function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
   if (started && !mapOpen) update(dt);
   updatePeople(dt, now);
+  updateRemotes(dt); if (started) sendMove(now);
   sky.position.copy(camera.position);
   // shadow camera follows the player, snapped to texels to avoid shimmer
   const snap = 220 / 2048, tx = Math.round(P.x / snap) * snap, tz = Math.round(P.z / snap) * snap;
@@ -1308,10 +1405,12 @@ async function boot() {
 $('go').addEventListener('click', () => {
   started = true; $('intro').hidden = true; speechOK = true;
   for (const id of ['where', 'mini', 'mode', 'cross']) $(id).hidden = false;
+  connectNet();
   if (isTouch) $('touch').hidden = false; else $('keys').hidden = false;
   if (!isTouch && canvas.requestPointerLock) { try { const r = canvas.requestPointerLock(); if (r && r.catch) r.catch(() => { }); } catch (e) { } }
 });
 window.__gcc = {
+  net: () => ({ me: myName, others: [...remotes.values()].filter(r => r.seen).map(r => r.name) }),
   P, view(x, y, z, yw, pt) { flying = true; P.set(x, y, z); yaw = yw; pitch = pt; update(0); },
   // stand at a lat/lon facing a compass heading (matches Google Street View's camera)
   at(lat, lon, hdg, pt = 0) { flying = false; teleport((lon - D.lon0) * 111320 * Math.cos(D.lat0 * Math.PI / 180), -(lat - D.lat0) * 110574); yaw = -hdg * Math.PI / 180; pitch = pt; update(0); },

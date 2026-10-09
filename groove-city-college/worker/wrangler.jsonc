@@ -1,0 +1,14 @@
+{
+  // Wrangler config for the multiplayer campus map. See README.md.
+  "name": "groove-city-college",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-09-01",
+  // src/page.html is the built map page; the Worker imports it as text
+  "rules": [{ "type": "Text", "globs": ["**/*.html"], "fallthrough": true }],
+  // one Durable Object instance ("campus") holds every connected visitor
+  "durable_objects": {
+    "bindings": [{ "name": "ROOM", "class_name": "MapRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MapRoom"] }],
+  "observability": { "enabled": true }
+}
